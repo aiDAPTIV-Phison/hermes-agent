@@ -4,7 +4,7 @@ import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
 import { getOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { turnController } from '../app/turnController.js'
 import { getTurnState, resetTurnState } from '../app/turnStore.js'
-import { patchUiState, resetUiState } from '../app/uiStore.js'
+import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import { estimateTokensRough } from '../lib/text.js'
 import type { Msg } from '../types.js'
 
@@ -130,6 +130,123 @@ describe('createGatewayEventHandler', () => {
     } as any)
 
     expect(ctx.system.sys).toHaveBeenCalledWith('compressing 968 messages (~123,400 tok)…')
+  })
+
+  it('updates context meter on live usage snapshots', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({
+      info: { model: 'edge/model', skills: {}, tools: {} },
+      sid: 'sid-1',
+      usage: { calls: 0, input: 0, output: 0, total: 0 }
+    })
+
+    onEvent({
+      payload: {
+        kind: 'usage',
+        text: '',
+        usage: { calls: 2, context_max: 128000, context_percent: 13, context_used: 16213, input: 1000, output: 200, total: 1200 }
+      },
+      type: 'status.update'
+    } as any)
+
+    expect(getUiState().usage.context_used).toBe(16213)
+    expect(getUiState().usage.context_max).toBe(128000)
+  })
+
+  it('shows compression badge while context is compacting', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({
+      info: { hybrid_tier: 'edge', model: 'edge/model', skills: {}, tools: {} },
+      sid: 'sid-1'
+    })
+
+    onEvent({
+      payload: {
+        kind: 'compressing',
+        model: 'stepfun/step-3.5-flash',
+        text: 'compressing 12 messages (~40,000 tok)…'
+      },
+      type: 'status.update'
+    } as any)
+
+    expect(getUiState().info?.hybrid_tier).toBe('compressing')
+    expect(getUiState().info?.model).toBe('stepfun/step-3.5-flash')
+  })
+
+  it('shows routing badge while hybrid classifier runs', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({
+      info: { hybrid_tier: 'edge', model: 'old/model', skills: {}, tools: {} },
+      sid: 'sid-1'
+    })
+
+    onEvent({
+      payload: {
+        hybrid_escalated: false,
+        hybrid_tier: 'classifying',
+        kind: 'hybrid',
+        text: 'classifying…'
+      },
+      type: 'status.update'
+    } as any)
+
+    expect(getUiState().info?.hybrid_tier).toBe('classifying')
+  })
+
+  it('patches session info when hybrid-gateway routes a turn', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({
+      info: {
+        model: 'default/model',
+        skills: {},
+        tools: {}
+      },
+      sid: 'sid-1'
+    })
+
+    onEvent({
+      payload: {
+        hybrid_escalated: false,
+        hybrid_tier: 'edge',
+        kind: 'hybrid',
+        model: 'zhipu/glm-4-flash',
+        text: 'edge · glm-4-flash'
+      },
+      type: 'status.update'
+    } as any)
+
+    expect(getUiState().info?.hybrid_tier).toBe('edge')
+    expect(getUiState().info?.model).toBe('zhipu/glm-4-flash')
+  })
+
+  it('prints auto-compression summary lines into the transcript', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({
+      payload: { kind: 'compressed', text: '✓ Compressed: 120 → 34 messages' },
+      type: 'status.update'
+    } as any)
+    onEvent({
+      payload: { kind: 'compressed', text: '  Approx request size: ~98,000 → ~24,000 tokens' },
+      type: 'status.update'
+    } as any)
+
+    expect(ctx.system.sys).toHaveBeenCalledWith('✓ Compressed: 120 → 34 messages')
+    expect(ctx.system.sys).toHaveBeenCalledWith('  Approx request size: ~98,000 → ~24,000 tokens')
   })
 
   it('surfaces self-improvement review summaries as a persistent system line', () => {

@@ -135,6 +135,10 @@ VALID_HOOKS: Set[str] = {
     # First non-None string wins. Useful for vocabulary/personality transformation.
     "transform_llm_output",
     "pre_llm_call",
+    # Per-turn model routing (hybrid gateway and similar). First valid override wins.
+    # Return {"provider", "model", "base_url"?, "api_key"?, "tier"?, "reason"?,
+    #         "models"?: {classifier, edge, cloud}} to swap the main agent backend.
+    "pre_model_resolve",
     "post_llm_call",
     "pre_api_request",
     "post_api_request",
@@ -1433,6 +1437,28 @@ def get_pre_tool_call_block_message(
         message = result.get("message")
         if isinstance(message, str) and message:
             return message
+
+    return None
+
+
+def get_pre_model_resolve_override(**kwargs: Any) -> Optional[Dict[str, Any]]:
+    """Return the first valid ``pre_model_resolve`` plugin override, or None.
+
+    Plugins return a dict with at least ``model`` and ``provider`` to replace
+    the main agent backend for the current turn.  Optional ``tier`` is stored
+    on the agent for hybrid length escalation; optional ``models`` maps tier
+    names to resolved provider/model/base_url snapshots.
+    """
+    hook_results = invoke_hook("pre_model_resolve", **kwargs)
+
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        model = (result.get("model") or "").strip()
+        provider = (result.get("provider") or "").strip()
+        if not model or not provider:
+            continue
+        return result
 
     return None
 

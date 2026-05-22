@@ -322,8 +322,9 @@ export class GatewayClient extends EventEmitter {
     const pyPath = env.PYTHONPATH?.trim()
 
     env.PYTHONPATH = pyPath ? `${root}${delimiter}${pyPath}` : root
+    env.PYTHONUNBUFFERED = '1'
     this.startReadyTimer(python, cwd)
-    this.proc = spawn(python, ['-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    this.proc = spawn(python, ['-u', '-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
 
     this.stdoutRl = createInterface({ input: this.proc.stdout! })
     this.stdoutRl.on('line', raw => {
@@ -339,11 +340,13 @@ export class GatewayClient extends EventEmitter {
 
     this.stderrRl = createInterface({ input: this.proc.stderr! })
     this.stderrRl.on('line', raw => {
-      const line = truncateLine(raw.trim())
+      const trimmed = raw.trim()
 
-      if (!line) {
+      if (!trimmed) {
         return
       }
+
+      const line = truncateLine(trimmed)
 
       this.pushLog(line)
       this.publish({ type: 'gateway.stderr', payload: { line } })

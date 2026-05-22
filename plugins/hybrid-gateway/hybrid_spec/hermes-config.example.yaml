@@ -1,0 +1,43 @@
+# Example hybrid_gateway configuration for Hermes
+# Copy relevant sections into ~/.hermes/config.yaml
+
+auxiliary:
+  classifier:
+    provider: custom
+    model: qwen2.5-3b-instruct
+    base_url: http://127.0.0.1:11434/v1
+    timeout: 15
+    max_tokens: 256
+
+custom_providers:
+  - name: gemma-4-26B
+    base_url: http://127.0.0.1:13141/v1
+    model: gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
+
+hybrid_gateway:
+  enabled: true
+  classifier:
+    mode: auxiliary
+    auxiliary_task: classifier
+    cacheEnabled: true
+    cacheTtlSeconds: 300
+    # Suppress model thinking during classification (lower latency, cleaner JSON).
+    disableThinking: false
+    # auto | gemma4-raw | qwen-nothink (used when disableThinking is true)
+    thinkingStrategy: auto
+    # systemPrompt: ""  # optional override of built-in classifier prompt
+  routing:
+    policy: cost-optimize-L2
+    policyArray: [classifier, classifier, edge, cloud, cloud]
+    bypassPatterns: []
+    edgeMaxContextTokens: 131072
+    skillRoutes:
+      - skillPattern: image-gen
+        forceTier: cloud
+        reason: Image generation requires cloud multimodal model
+  models:
+    classifier: { ref: auxiliary.classifier }
+    edge: { ref: custom_providers.gemma-4-26B }
+    cloud:
+      provider: openrouter
+      model: anthropic/claude-sonnet-4

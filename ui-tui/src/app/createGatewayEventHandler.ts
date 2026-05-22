@@ -86,6 +86,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   let pendingThinkingStatus = ''
   let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null
   let startupPromptSubmitted = false
+  let lastCompressingTranscript = ''
+  let lastCompressedTranscript = ''
 
   // Inject the disk-save callback into turnController so recordMessageComplete
   // can fire-and-forget a persist without having to plumb a gateway ref around.
@@ -328,20 +330,91 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'message.start':
+        lastCompressingTranscript = ''
+        lastCompressedTranscript = ''
         turnController.startMessage()
 
         return
       case 'status.update': {
         const p = ev.payload
 
-        if (!p?.text) {
+        if (!p) {
+          return
+        }
+
+        if (p.kind === 'usage' && p.usage) {
+          patchUiState(state => ({ ...state, usage: { ...state.usage, ...p.usage } }))
+
+          return
+        }
+
+        if (!p.text) {
           return
         }
 
         setStatus(p.text)
 
         if (p.kind === 'compressing') {
-          sys(p.text)
+          const compressionModel =
+            typeof p.model === 'string' && p.model.trim() ? p.model.trim() : getUiState().info?.model
+          patchUiState(state => ({
+            ...state,
+            info: state.info
+              ? {
+                  ...state.info,
+                  ...(compressionModel ? { model: compressionModel } : {}),
+                  hybrid_escalated: false,
+                  hybrid_reason: undefined,
+                  hybrid_tier: 'compressing'
+                }
+              : state.info
+          }))
+          if (p.text !== lastCompressingTranscript) {
+            lastCompressingTranscript = p.text
+            sys(p.text)
+          }
+
+          return
+        }
+
+        if (p.kind === 'compressed') {
+          if (p.text !== lastCompressedTranscript) {
+            lastCompressedTranscript = p.text
+            sys(p.text)
+          }
+
+          return
+        }
+
+        if (p.kind === 'hybrid') {
+          const tier = typeof p.hybrid_tier === 'string' ? p.hybrid_tier.trim().toLowerCase() : ''
+          const model =
+            typeof p.model === 'string' && p.model.trim() ? p.model.trim() : getUiState().info?.model
+
+          patchUiState(state => ({
+            ...state,
+            info: state.info
+              ? {
+                  ...state.info,
+                  ...(model ? { model } : {}),
+                  ...(tier
+                    ? {
+                        hybrid_escalated: Boolean(p.hybrid_escalated),
+                        hybrid_tier: tier
+                      }
+                    : {
+                        hybrid_escalated: false,
+                        hybrid_reason: undefined,
+                        hybrid_tier: undefined
+                      })
+                }
+              : state.info
+          }))
+
+          if (p.text) {
+            setStatus(p.text)
+          }
+
           return
         }
 

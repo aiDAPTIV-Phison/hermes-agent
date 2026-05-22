@@ -606,6 +606,79 @@ def test_status_callback_emits_kind_and_text():
     )
 
 
+def test_status_callback_forwards_usage_snapshot():
+    agent = types.SimpleNamespace(
+        model="edge/model",
+        session_input_tokens=1000,
+        session_output_tokens=200,
+        session_total_tokens=1200,
+        session_api_calls=2,
+        context_compressor=types.SimpleNamespace(
+            last_prompt_tokens=16213,
+            context_length=128000,
+            compression_count=0,
+        ),
+    )
+    with patch("tui_gateway.server._emit") as emit:
+        cb = server._agent_cbs("sid")["status_callback"]
+        cb("usage", "", usage={"context_used": 16213, "context_max": 128000})
+
+    emit.assert_called_once_with(
+        "status.update",
+        "sid",
+        {"kind": "usage", "text": "", "usage": {"context_used": 16213, "context_max": 128000}},
+    )
+
+
+def test_status_update_flushes_stdout_for_live_progress():
+    with patch("tui_gateway.server._emit"), patch(
+        "tui_gateway.server._real_stdout"
+    ) as stdout:
+        server._status_update("sid", "compressing", "⠋ compressing 3 messages…")
+    stdout.flush.assert_called_once()
+
+
+def test_status_callback_forwards_hybrid_metadata():
+    with patch("tui_gateway.server._emit") as emit:
+        cb = server._agent_cbs("sid")["status_callback"]
+        cb(
+            "hybrid",
+            "edge · glm-4-flash",
+            hybrid_tier="edge",
+            hybrid_escalated=False,
+            model="zhipu/glm-4-flash",
+        )
+
+    emit.assert_called_once_with(
+        "status.update",
+        "sid",
+        {
+            "kind": "hybrid",
+            "text": "edge · glm-4-flash",
+            "hybrid_tier": "edge",
+            "hybrid_escalated": False,
+            "model": "zhipu/glm-4-flash",
+        },
+    )
+
+
+def test_session_info_includes_hybrid_tier():
+    agent = types.SimpleNamespace(
+        model="zhipu/glm-4-flash",
+        reasoning_config=None,
+        service_tier=None,
+        tools=[],
+        _hybrid_tier="edge",
+        _hybrid_escalated=True,
+        _hybrid_reason="policy=cost-optimize-L2",
+    )
+    with patch("tui_gateway.server._get_usage", return_value={"total": 0, "input": 0, "output": 0, "calls": 0}):
+        info = server._session_info(agent)
+    assert info["hybrid_tier"] == "edge"
+    assert info["hybrid_escalated"] is True
+    assert "policy=" in info["hybrid_reason"]
+
+
 def test_status_callback_accepts_single_message_argument():
     with patch("tui_gateway.server._emit") as emit:
         cb = server._agent_cbs("sid")["status_callback"]

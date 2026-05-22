@@ -389,15 +389,21 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
 
 
-def _status_update(sid: str, kind: str, text: str | None = None):
+def _status_update(sid: str, kind: str, text: str | None = None, **extra):
     body = (text if text is not None else kind).strip()
-    if not body:
+    if not body and not extra:
         return
-    _emit(
-        "status.update",
-        sid,
-        {"kind": kind if text is not None else "status", "text": body},
-    )
+    payload = {"kind": kind if text is not None else "status", "text": body}
+    for key, value in extra.items():
+        if value is not None:
+            payload[key] = value
+    _emit("status.update", sid, payload)
+    # Flush JSON-RPC stdout promptly during long blocking work (compression,
+    # hybrid classify) so the TUI status bar updates without a stderr mirror.
+    try:
+        _real_stdout.flush()
+    except Exception:
+        pass
 
 
 def _estimate_image_tokens(width: int, height: int) -> int:
@@ -1187,6 +1193,8 @@ def _compress_session_history(
         None,
         approx_tokens=approx_tokens,
         focus_topic=focus_topic or None,
+        emit_progress=False,
+        emit_summary=False,
     )
     with session["history_lock"]:
         if int(session.get("history_version", 0)) != history_version:
@@ -1277,48 +1285,9 @@ def _sync_session_key_after_compress(
 
 
 def _get_usage(agent) -> dict:
-    g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
-    usage = {
-        "model": getattr(agent, "model", "") or "",
-        "input": g("session_input_tokens", "session_prompt_tokens"),
-        "output": g("session_output_tokens", "session_completion_tokens"),
-        "cache_read": g("session_cache_read_tokens"),
-        "cache_write": g("session_cache_write_tokens"),
-        "reasoning": g("session_reasoning_tokens"),
-        "prompt": g("session_prompt_tokens"),
-        "completion": g("session_completion_tokens"),
-        "total": g("session_total_tokens"),
-        "calls": g("session_api_calls"),
-    }
-    comp = getattr(agent, "context_compressor", None)
-    if comp:
-        ctx_used = getattr(comp, "last_prompt_tokens", 0) or usage["total"] or 0
-        ctx_max = getattr(comp, "context_length", 0) or 0
-        if ctx_max:
-            usage["context_used"] = ctx_used
-            usage["context_max"] = ctx_max
-            usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
-        usage["compressions"] = getattr(comp, "compression_count", 0) or 0
-    try:
-        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+    from agent.tui_usage import build_agent_usage
 
-        cost = estimate_usage_cost(
-            usage["model"],
-            CanonicalUsage(
-                input_tokens=usage["input"],
-                output_tokens=usage["output"],
-                cache_read_tokens=usage["cache_read"],
-                cache_write_tokens=usage["cache_write"],
-            ),
-            provider=getattr(agent, "provider", None),
-            base_url=getattr(agent, "base_url", None),
-        )
-        usage["cost_status"] = cost.status
-        if cost.amount_usd is not None:
-            usage["cost_usd"] = float(cost.amount_usd)
-    except Exception:
-        pass
-    return usage
+    return build_agent_usage(agent)
 
 
 def _probe_credentials(agent) -> str:
@@ -1430,6 +1399,13 @@ def _session_info(agent) -> dict:
         info["update_command"] = recommended_update_command()
     except Exception:
         pass
+    tier = getattr(agent, "_hybrid_tier", None)
+    if isinstance(tier, str) and tier.strip():
+        info["hybrid_tier"] = tier.strip().lower()
+        info["hybrid_escalated"] = bool(getattr(agent, "_hybrid_escalated", False))
+        reason = getattr(agent, "_hybrid_reason", None)
+        if isinstance(reason, str) and reason.strip():
+            info["hybrid_reason"] = reason.strip()[:160]
     return info
 
 
@@ -1642,9 +1618,10 @@ def _agent_cbs(sid: str) -> dict:
         and _emit("tool.generating", sid, {"name": name}),
         "thinking_callback": lambda text: _emit("thinking.delta", sid, {"text": text}),
         "reasoning_callback": lambda text: _emit("reasoning.delta", sid, {"text": text}),
-        "status_callback": lambda kind, text=None: _status_update(
-            sid, str(kind), None if text is None else str(text)
+        "status_callback": lambda kind, text=None, **kw: _status_update(
+            sid, str(kind), None if text is None else str(text), **kw
         ),
+        "status_flush_callback": lambda: _real_stdout.flush(),
         "clarify_callback": lambda q, c: _block(
             "clarify.request", sid, {"question": q, "choices": c}
         ),
@@ -2543,12 +2520,37 @@ def _(rid, params: dict) -> dict:
         )
 
         if before_count >= 4:
-            focus_suffix = f', focus: "{focus_topic}"' if focus_topic else ""
+            from agent.context_compressor import format_compressing_progress_text
+
+            _summary_budget = None
+            _summarize_input_tokens = None
+            _compressor = getattr(_agent, "context_compressor", None)
+            if _compressor is not None:
+                try:
+                    _preview = _compressor.preview_compression_stats(before_messages)
+                    if _preview:
+                        _summary_budget = _preview.get("summary_budget")
+                        _summarize_input_tokens = _preview.get(
+                            "summarize_input_tokens"
+                        )
+                except Exception:
+                    pass
+            _compress_model = ""
+            try:
+                _compress_model = _agent._effective_compression_model()
+            except Exception:
+                pass
             _status_update(
                 sid,
                 "compressing",
-                f"⠋ compressing {before_count} messages "
-                f"(~{before_tokens:,} tok){focus_suffix}…",
+                format_compressing_progress_text(
+                    before_count,
+                    approx_tokens=before_tokens or None,
+                    summary_budget=_summary_budget,
+                    summarize_input_tokens=_summarize_input_tokens,
+                    focus_topic=focus_topic or None,
+                ),
+                **({"model": _compress_model} if _compress_model else {}),
             )
 
         try:
@@ -3327,6 +3329,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             if rendered:
                 payload["rendered"] = rendered
             _emit("message.complete", sid, payload)
+            _emit("session.info", sid, _session_info(agent))
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge

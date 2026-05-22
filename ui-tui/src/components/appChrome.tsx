@@ -245,6 +245,42 @@ const shortModelLabel = (model: string) =>
 const modelLabel = (model: string, effort?: string, fast?: boolean) =>
   [shortModelLabel(model), effortLabel(effort), fast ? 'fast' : ''].filter(Boolean).join(' ')
 
+const hybridTierBadge = (tier?: string, escalated?: boolean) => {
+  const normalized = (tier ?? '').trim().toLowerCase()
+  if (!normalized) {
+    return ''
+  }
+
+  if (normalized === 'classifying') {
+    return 'routing'
+  }
+
+  if (normalized === 'compressing') {
+    return 'compression'
+  }
+
+  const label = normalized === 'classifier' ? 'cls' : normalized
+
+  return escalated ? `${label}↑` : label
+}
+
+const hybridTierColor = (tier: string, t: Theme) => {
+  switch (tier) {
+    case 'classifying':
+      return t.color.accent
+    case 'classifier':
+      return t.color.muted
+    case 'compressing':
+      return t.color.accent
+    case 'edge':
+      return t.color.warn
+    case 'cloud':
+      return t.color.accent
+    default:
+      return t.color.label
+  }
+}
+
 export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
   const [active, setActive] = useState(false)
   const [color, setColor] = useState(t.color.accent)
@@ -277,6 +313,8 @@ export function StatusRule({
   status,
   statusColor,
   model,
+  hybridEscalated,
+  hybridTier,
   modelFast,
   modelReasoningEffort,
   usage,
@@ -309,6 +347,14 @@ export function StatusRule({
           ) : (
             <Text color={statusColor}>{status}</Text>
           )}
+          {hybridTier ? (
+            <Text color={t.color.muted}>
+              {' │ '}
+              <Text color={hybridTierColor(hybridTier, t)} bold>
+                {hybridTierBadge(hybridTier, hybridEscalated)}
+              </Text>
+            </Text>
+          ) : null}
           <Text color={t.color.muted}> │ {modelLabel(model, modelReasoningEffort, modelFast)}</Text>
           {ctxLabel ? <Text color={t.color.muted}> │ {ctxLabel}</Text> : null}
           {bar ? (
@@ -458,6 +504,8 @@ interface StatusRuleProps {
   busy: boolean
   cols: number
   cwdLabel: string
+  hybridEscalated?: boolean
+  hybridTier?: string
   model: string
   modelFast?: boolean
   modelReasoningEffort?: string

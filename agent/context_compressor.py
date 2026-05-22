@@ -16,6 +16,7 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -29,6 +30,7 @@ from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     get_model_context_length,
     estimate_messages_tokens_rough,
+    estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
 
@@ -52,7 +54,7 @@ SUMMARY_PREFIX = (
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
 # Minimum tokens for the summary output
-_MIN_SUMMARY_TOKENS = 2000
+_MIN_SUMMARY_TOKENS = 1000
 # Proportion of compressed content to allocate for summary
 _SUMMARY_RATIO = 0.20
 # Absolute ceiling for summary tokens (even on very large context windows)
@@ -74,6 +76,56 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+
+
+def _format_compression_target_hint(
+    *,
+    summarize_input_tokens: int | None = None,
+    summary_budget: int | None = None,
+) -> str | None:
+    """Format summarize-input → summary-output token hint for progress UI."""
+    if summarize_input_tokens and summary_budget:
+        return (
+            f"target ~{summarize_input_tokens:,} -> ~{summary_budget:,}"
+        )
+    if summary_budget:
+        return f"target ~{summary_budget:,}"
+    if summarize_input_tokens:
+        return f"summarize ~{summarize_input_tokens:,} tok"
+    return None
+
+
+def format_compressing_progress_text(
+    message_count: int,
+    *,
+    approx_tokens: int | None = None,
+    summary_budget: int | None = None,
+    summarize_input_tokens: int | None = None,
+    focus_topic: str | None = None,
+) -> str:
+    """Build the in-flight compression status line for TUI / gateway / CLI.
+
+    ``summarize_input_tokens`` is a rough count of the serialized middle turns
+    (``content_to_summarize``) fed to the summary model; ``summary_budget`` is
+    the requested summary output size from ``_compute_summary_budget``.
+    """
+    focus_suffix = f', focus: "{focus_topic}"' if focus_topic else ""
+    target_hint = _format_compression_target_hint(
+        summarize_input_tokens=summarize_input_tokens,
+        summary_budget=summary_budget,
+    )
+    if approx_tokens:
+        tok = f"(~{approx_tokens:,} tok"
+        if target_hint:
+            tok += f", {target_hint}"
+        tok += ")"
+        return f"⠋ compressing {message_count} messages {tok}{focus_suffix}…"
+    if target_hint:
+        return (
+            f"⠋ compressing {message_count} messages "
+            f"({target_hint}){focus_suffix}…"
+        )
+    return f"⠋ compressing {message_count} messages{focus_suffix}…"
 
 
 def _content_length_for_budget(raw_content: Any) -> int:
@@ -687,6 +739,16 @@ class ContextCompressor(ContextEngine):
     # ------------------------------------------------------------------
     # Summarization
     # ------------------------------------------------------------------
+
+    def _estimate_summarize_input_tokens(
+        self, turns_to_summarize: List[Dict[str, Any]]
+    ) -> int:
+        """Rough tokens for serialized middle turns sent to the summary model."""
+        if not turns_to_summarize:
+            return 0
+        return estimate_tokens_rough(
+            self._serialize_for_summary(turns_to_summarize)
+        )
 
     def _compute_summary_budget(self, turns_to_summarize: List[Dict[str, Any]]) -> int:
         """Scale summary token budget with the amount of content being compressed.
@@ -1313,7 +1375,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             token_budget = self.tail_token_budget
         n = len(messages)
         # Hard minimum: always keep at least 3 messages in the tail
-        min_tail = min(3, n - head_end - 1) if n - head_end > 1 else 0
+        min_tail = min(1, n - head_end - 1) if n - head_end > 1 else 0
         soft_ceiling = int(token_budget * 1.5)
         accumulated = 0
         cut_idx = n  # start from beyond the end
@@ -1367,6 +1429,61 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
         return compress_start < compress_end
 
+    def _resolve_compression_window(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        hydrate_previous_summary: bool = False,
+    ) -> Optional[tuple[int, int, List[Dict[str, Any]]]]:
+        """Return (compress_start, compress_end, turns_to_summarize) or None."""
+        compress_start = self._protect_head_size(messages)
+        compress_start = self._align_boundary_forward(messages, compress_start)
+        compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+        if compress_start >= compress_end:
+            return None
+
+        turns_to_summarize = messages[compress_start:compress_end]
+        summary_search_start = 1 if messages and messages[0].get("role") == "system" else 0
+        summary_idx, summary_body = self._find_latest_context_summary(
+            messages,
+            summary_search_start,
+            compress_end,
+        )
+        if summary_idx is not None:
+            if hydrate_previous_summary and summary_body and not self._previous_summary:
+                self._previous_summary = summary_body
+            turns_to_summarize = messages[max(compress_start, summary_idx + 1):compress_end]
+        return compress_start, compress_end, turns_to_summarize
+
+    def preview_compression_stats(
+        self, messages: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, int]]:
+        """Estimate summary target tokens for UI before ``compress()`` runs."""
+        work = copy.deepcopy(messages)
+        n_messages = len(work)
+        _min_for_compress = self._protect_head_size(work) + 3 + 1
+        if n_messages <= _min_for_compress:
+            return None
+
+        work, _ = self._prune_old_tool_results(
+            work,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=self.tail_token_budget,
+        )
+        window = self._resolve_compression_window(work)
+        if not window:
+            return None
+        _, _, turns_to_summarize = window
+        if not turns_to_summarize:
+            return None
+        return {
+            "summary_budget": self._compute_summary_budget(turns_to_summarize),
+            "summarize_input_tokens": self._estimate_summarize_input_tokens(
+                turns_to_summarize
+            ),
+            "summarize_turns": len(turns_to_summarize),
+        }
+
     # ------------------------------------------------------------------
     # Main compression entry point
     # ------------------------------------------------------------------
@@ -1419,33 +1536,12 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
 
         # Phase 2: Determine boundaries
-        compress_start = self._protect_head_size(messages)
-        compress_start = self._align_boundary_forward(messages, compress_start)
-
-        # Use token-budget tail protection instead of fixed message count
-        compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
-
-        if compress_start >= compress_end:
-            return messages
-
-        turns_to_summarize = messages[compress_start:compress_end]
-        # A persisted handoff summary can sit in the protected head after a
-        # resume (commonly immediately after the system prompt). Search from
-        # the first non-system message through the compression window so we can
-        # rehydrate iterative-summary state without serializing that handoff as
-        # a new turn. Protected messages after the handoff remain live context,
-        # so only summarize messages that are both after the handoff and inside
-        # the current compression window.
-        summary_search_start = 1 if messages and messages[0].get("role") == "system" else 0
-        summary_idx, summary_body = self._find_latest_context_summary(
-            messages,
-            summary_search_start,
-            compress_end,
+        window = self._resolve_compression_window(
+            messages, hydrate_previous_summary=True
         )
-        if summary_idx is not None:
-            if summary_body and not self._previous_summary:
-                self._previous_summary = summary_body
-            turns_to_summarize = messages[max(compress_start, summary_idx + 1):compress_end]
+        if not window:
+            return messages
+        compress_start, compress_end, turns_to_summarize = window
 
         if not self.quiet_mode:
             logger.info(

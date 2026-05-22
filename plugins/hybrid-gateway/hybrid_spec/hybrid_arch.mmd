@@ -1,0 +1,10 @@
+flowchart TD
+  input[UserInput] --> precheck[PreCheck_new_bypass_context]
+  precheck --> classify[Classify_auxiliary_or_heuristic]
+  classify --> postrules[PostRules_skills_ge_4]
+  postrules --> route[Route_skillRoutes_policyArray_policy]
+  route --> agent[AIAgent_run_conversation]
+  agent --> length{edge_length_truncated_3x}
+  length -->|yes| cloud[switch_model_cloud]
+  length -->|no| done[Response]
+  cloud --> done

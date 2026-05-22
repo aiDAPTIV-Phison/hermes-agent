@@ -3,7 +3,11 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
+from agent.context_compressor import (
+    ContextCompressor,
+    SUMMARY_PREFIX,
+    format_compressing_progress_text,
+)
 
 
 @pytest.fixture()
@@ -1849,3 +1853,72 @@ class TestTruncateToolCallArgsJson:
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
         assert parsed["content"].endswith("...[truncated]")
+
+
+class TestCompressingProgressText:
+    def test_tokens_and_target(self):
+        text = format_compressing_progress_text(
+            9, approx_tokens=17473, summary_budget=3494
+        )
+        assert text == "⠋ compressing 9 messages (~17,473 tok, target ~3,494)…"
+
+    def test_tokens_and_summarize_input_arrow(self):
+        text = format_compressing_progress_text(
+            9,
+            approx_tokens=17461,
+            summarize_input_tokens=4000,
+            summary_budget=2000,
+        )
+        assert text == (
+            "⠋ compressing 9 messages "
+            "(~17,461 tok, target ~4,000 -> ~2,000)…"
+        )
+
+    def test_tokens_only(self):
+        text = format_compressing_progress_text(3, approx_tokens=1200)
+        assert text == "⠋ compressing 3 messages (~1,200 tok)…"
+
+    def test_focus_suffix(self):
+        text = format_compressing_progress_text(
+            2,
+            approx_tokens=500,
+            summarize_input_tokens=1200,
+            summary_budget=2000,
+            focus_topic="auth",
+        )
+        assert 'focus: "auth"' in text
+        assert "target ~1,200 -> ~2,000" in text
+
+
+class TestPreviewCompressionStats:
+    def test_returns_summary_budget_for_compressible_history(self, compressor):
+        msgs = [{"role": "system", "content": "sys"}] + [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 2000}
+            for i in range(12)
+        ]
+        stats = compressor.preview_compression_stats(msgs)
+        assert stats is not None
+        assert stats["summary_budget"] >= 2000
+        assert stats["summarize_input_tokens"] > 0
+        assert stats["summarize_turns"] >= 1
+
+    def test_too_few_messages_returns_none(self, compressor):
+        msgs = [{"role": "user", "content": "hi"}] * 4
+        assert compressor.preview_compression_stats(msgs) is None
+
+    def test_summarize_input_tokens_match_serialized_body(self, compressor):
+        msgs = [{"role": "system", "content": "sys"}] + [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": "detail " * 100}
+            for i in range(12)
+        ]
+        stats = compressor.preview_compression_stats(msgs)
+        assert stats is not None
+        window = compressor._resolve_compression_window(msgs)
+        assert window is not None
+        _, _, turns = window
+        from agent.model_metadata import estimate_tokens_rough
+
+        expected = estimate_tokens_rough(
+            compressor._serialize_for_summary(turns)
+        )
+        assert stats["summarize_input_tokens"] == expected

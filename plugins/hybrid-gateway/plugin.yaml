@@ -1,0 +1,6 @@
+name: hybrid-gateway
+version: 1.0.0
+description: "Route each turn between classifier, edge, and cloud models via policy, policyArray, and skillRoutes."
+author: "Phison / Hermes"
+hooks:
+  - pre_model_resolve

@@ -367,7 +367,7 @@ def register(ctx):
 
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility — new parameters may be added in future versions without breaking your plugin.
 - If a callback **crashes**, it's logged and skipped. Other hooks and the agent continue normally. A misbehaving plugin can never break the agent.
-- Two hooks' return values affect behavior: [`pre_tool_call`](#pre_tool_call) can **block** the tool, and [`pre_llm_call`](#pre_llm_call) can **inject context** into the LLM call. All other hooks are fire-and-forget observers.
+- Three hooks' return values affect behavior: [`pre_tool_call`](#pre_tool_call) can **block** the tool; [`pre_model_resolve`](#pre_model_resolve) can **override model/provider** for the turn; [`pre_llm_call`](#pre_llm_call) can **inject context** into the LLM call. All other hooks are fire-and-forget observers.
 
 ### Quick reference
 
@@ -375,6 +375,7 @@ def register(ctx):
 |------|-----------|---------|
 | [`pre_tool_call`](#pre_tool_call) | Before any tool executes | `{"action": "block", "message": str}` to veto the call |
 | [`post_tool_call`](#post_tool_call) | After any tool returns | ignored |
+| [`pre_model_resolve`](#pre_model_resolve) | Once per turn, before `pre_llm_call` and the tool loop | Model override dict (`provider`, `model`, optional `base_url`, `tier`, `models`) — first valid wins |
 | [`pre_llm_call`](#pre_llm_call) | Once per turn, before the tool-calling loop | `{"context": str}` to prepend context to the user message |
 | [`post_llm_call`](#post_llm_call) | Once per turn, after the tool-calling loop | ignored |
 | [`on_session_start`](#on_session_start) | New session created (first turn only) | ignored |
@@ -501,9 +502,28 @@ def register(ctx):
 
 ---
 
+### `pre_model_resolve`
+
+Fires **once per turn**, before [`pre_llm_call`](#pre_llm_call) and the tool-calling loop. Used by the [Hybrid Gateway](hybrid-gateway) plugin to pick classifier / edge / cloud backends.
+
+**Return value:** First plugin returning a dict with both `provider` and `model` wins. Optional keys: `base_url`, `api_key`, `api_mode`, `tier`, `reason`, `models` (tier snapshots for mid-turn cloud escalation).
+
+```python
+return {
+    "provider": "custom",
+    "model": "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+    "base_url": "http://127.0.0.1:13141/v1",
+    "tier": "edge",
+    "reason": "policy=cost-optimize-L2, complexity=moderate -> edge",
+    "models": {"edge": {...}, "cloud": {...}},
+}
+```
+
+---
+
 ### `pre_llm_call`
 
-Fires **once per turn**, before the tool-calling loop begins. This is the **only hook whose return value is used** — it can inject context into the current turn's user message.
+Fires **once per turn**, before the tool-calling loop begins. Return value can inject context into the current turn's user message.
 
 **Callback signature:**
 

@@ -134,6 +134,16 @@ _DEFAULT_PAYLOADS = {
         "model": "gpt-4",
         "platform": "cli",
     },
+    "pre_model_resolve": {
+        "session_id": "test-session",
+        "user_message": "What is the weather?",
+        "conversation_history": [],
+        "is_first_turn": False,
+        "model": "gpt-4",
+        "provider": "openrouter",
+        "platform": "cli",
+        "approximate_context_tokens": 1024,
+    },
     "post_llm_call": {
         "session_id": "test-session",
         "model": "gpt-4",

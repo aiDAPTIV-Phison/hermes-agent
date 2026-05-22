@@ -145,6 +145,9 @@ export interface McpServerStatus {
 export interface SessionInfo {
   cwd?: string
   fast?: boolean
+  hybrid_escalated?: boolean
+  hybrid_reason?: string
+  hybrid_tier?: 'classifier' | 'classifying' | 'cloud' | 'edge' | string
   lazy?: boolean
   mcp_servers?: McpServerStatus[]
   model: string

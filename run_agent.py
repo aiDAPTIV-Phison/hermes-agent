@@ -1173,6 +1173,7 @@ class AIAgent:
         interim_assistant_callback: callable = None,
         tool_gen_callback: callable = None,
         status_callback: callable = None,
+        status_flush_callback: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
@@ -1397,6 +1398,7 @@ class AIAgent:
         self.stream_delta_callback = stream_delta_callback
         self.interim_assistant_callback = interim_assistant_callback
         self.status_callback = status_callback
+        self.status_flush_callback = status_flush_callback
         self.tool_gen_callback = tool_gen_callback
 
         
@@ -1850,6 +1852,11 @@ class AIAgent:
             self._fallback_chain = []
         self._fallback_index = 0
         self._fallback_activated = getattr(self, "_fallback_activated", False)
+        # Hybrid gateway state (pre_model_resolve hook + length escalation).
+        self._hybrid_tier: Optional[str] = None
+        self._hybrid_models: Dict[str, Any] = {}
+        self._hybrid_reason: str = ""
+        self._hybrid_escalated: bool = False
         # Legacy attribute kept for backward compat (tests, external callers)
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         if self._fallback_chain and not self.quiet_mode:
@@ -2489,6 +2496,9 @@ class AIAgent:
             else:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
 
+        # Hybrid-gateway: compression triggers use edge ctx, not primary/cloud.
+        self._sync_hybrid_edge_compression_context()
+
         # Check immediately so CLI users see the warning at startup.
         # Gateway status_callback is not yet wired, so any warning is stored
         # in _compression_warning and replayed in the first run_conversation().
@@ -2639,6 +2649,239 @@ class AIAgent:
         except Exception as err:
             logger.debug("LM Studio preload skipped: %s", err)
 
+    def apply_hybrid_model_resolve(self, override: Dict[str, Any]) -> bool:
+        """Apply a ``pre_model_resolve`` plugin override for the current turn."""
+        if not isinstance(override, dict):
+            return False
+        model = (override.get("model") or "").strip()
+        provider = (override.get("provider") or "").strip()
+        if not model or not provider:
+            return False
+
+        tier = override.get("tier")
+        if isinstance(tier, str) and tier.strip():
+            self._hybrid_tier = tier.strip().lower()
+        self._hybrid_reason = str(override.get("reason") or "")
+        models = override.get("models")
+        if isinstance(models, dict):
+            self._hybrid_models = models
+        self._hybrid_escalated = False
+
+        base_url = (override.get("base_url") or "").strip()
+        api_key = (override.get("api_key") or "").strip()
+        api_mode = (override.get("api_mode") or "").strip()
+        self.switch_model(
+            model,
+            provider,
+            api_key=api_key,
+            base_url=base_url,
+            api_mode=api_mode,
+        )
+        logging.info(
+            "%shybrid-gateway: tier=%s model=%s/%s reason=%s",
+            self.log_prefix,
+            self._hybrid_tier or "?",
+            provider,
+            model,
+            self._hybrid_reason[:120] if self._hybrid_reason else "",
+        )
+        self._emit_hybrid_route_status()
+        return True
+
+    def _escalate_hybrid_to_cloud(self, *, escalated_note: str = "length→cloud") -> bool:
+        """Switch from edge to cloud when edge limits are exhausted.
+
+        Used after length-continuation retries fail and when context compression
+        cannot shrink the session further (hybrid-gateway edge tier only).
+        """
+        if getattr(self, "_hybrid_escalated", False):
+            return False
+        if getattr(self, "_hybrid_tier", None) != "edge":
+            return False
+        cloud = (getattr(self, "_hybrid_models", None) or {}).get("cloud")
+        if not isinstance(cloud, dict):
+            return False
+        model = (cloud.get("model") or "").strip()
+        provider = (cloud.get("provider") or "").strip()
+        if not model or not provider:
+            return False
+
+        self._hybrid_escalated = True
+        self._hybrid_tier = "cloud"
+        base_url = (cloud.get("base_url") or "").strip()
+        api_key = (cloud.get("api_key") or "").strip()
+        api_mode = (cloud.get("api_mode") or "").strip()
+        self.switch_model(
+            model,
+            provider,
+            api_key=api_key,
+            base_url=base_url,
+            api_mode=api_mode,
+        )
+        logging.info(
+            "%shybrid-gateway: %s — escalated to cloud %s/%s",
+            self.log_prefix,
+            escalated_note or "edge limit",
+            provider,
+            model,
+        )
+        self._emit_hybrid_route_status(escalated_note=escalated_note)
+        return True
+
+    def _flush_status_callback(self) -> None:
+        """Best-effort push of pending gateway/TUI status frames (stdio flush)."""
+        flush = getattr(self, "status_flush_callback", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception:
+                pass
+
+    def _clear_hybrid_badge(self) -> None:
+        """Remove the hybrid route badge (e.g. while compressing)."""
+        if self.status_callback:
+            try:
+                self.status_callback(
+                    "hybrid",
+                    "",
+                    hybrid_tier="",
+                    hybrid_escalated=False,
+                    model="",
+                )
+            except TypeError:
+                pass
+            except Exception:
+                logger.debug(
+                    "status_callback error in _clear_hybrid_badge",
+                    exc_info=True,
+                )
+        self._flush_status_callback()
+
+    def _emit_hybrid_phase(self, phase: str | None) -> None:
+        """Show transient hybrid-gateway work (classify) in the TUI.
+
+        Unlike :meth:`_emit_hybrid_route_status`, this does not switch the main
+        agent model — it only updates the status badge while the auxiliary
+        classifier runs.
+        """
+        if phase == "classifying":
+            text = "classifying…"
+            tier = "classifying"
+            escalated = False
+            model = ""
+        else:
+            return
+
+        try:
+            self._vprint(f"{self.log_prefix}hybrid {text or '(idle)'}", force=True)
+        except Exception:
+            pass
+        if self.status_callback:
+            try:
+                self.status_callback(
+                    "hybrid",
+                    text,
+                    hybrid_tier=tier or "",
+                    hybrid_escalated=escalated,
+                    model=model,
+                )
+            except TypeError:
+                if text:
+                    self.status_callback("hybrid", text)
+            except Exception:
+                logger.debug(
+                    "status_callback error in _emit_hybrid_phase",
+                    exc_info=True,
+                )
+        self._flush_status_callback()
+
+    def _emit_hybrid_route_status(self, *, escalated_note: str = "") -> None:
+        """Notify gateway/TUI which hybrid-gateway tier is active this turn."""
+        tier = (getattr(self, "_hybrid_tier", None) or "").strip().lower()
+        if not tier:
+            return
+        escalated = bool(getattr(self, "_hybrid_escalated", False))
+        short_model = (getattr(self, "model", None) or "").split("/")[-1].strip()
+        tier_label = "cls" if tier == "classifier" else tier
+        parts = [tier_label]
+        if escalated:
+            parts.append("↑cloud")
+        if escalated_note:
+            parts.append(escalated_note)
+        if short_model:
+            parts.append(short_model)
+        text = " · ".join(parts)
+        try:
+            self._vprint(f"{self.log_prefix}hybrid {text}", force=True)
+        except Exception:
+            pass
+        if self.status_callback:
+            try:
+                self.status_callback(
+                    "hybrid",
+                    text,
+                    hybrid_tier=tier,
+                    hybrid_escalated=escalated,
+                    model=getattr(self, "model", "") or "",
+                )
+            except TypeError:
+                self.status_callback("hybrid", text)
+            except Exception:
+                logger.debug(
+                    "status_callback error in _emit_hybrid_route_status",
+                    exc_info=True,
+                )
+        self._flush_status_callback()
+
+    def _sync_hybrid_edge_compression_context(self) -> bool:
+        """Size compression thresholds against the hybrid-gateway edge model.
+
+        Preflight compression runs before ``pre_model_resolve``, so without
+        this sync the compressor can keep the previous turn's (or primary)
+        model context window while the next turn routes to edge.
+        """
+        cc = getattr(self, "context_compressor", None)
+        if cc is None:
+            return False
+        try:
+            from hermes_cli.plugins import _ensure_plugins_discovered
+
+            _ensure_plugins_discovered()
+            from hermes_plugins.hybrid_gateway.model_resolve import (
+                load_full_config,
+                resolve_edge_context_length,
+            )
+        except ImportError:
+            return False
+        hg = load_full_config()
+        if not hg:
+            return False
+        edge = (hg.get("models") or {}).get("edge") or {}
+        model = (edge.get("model") or "").strip()
+        if not model:
+            return False
+        ctx = resolve_edge_context_length(hg)
+        if not ctx:
+            return False
+        if getattr(cc, "context_length", None) == ctx:
+            return True
+        cc.update_model(
+            model=model,
+            context_length=ctx,
+            base_url=(edge.get("base_url") or "").strip(),
+            api_key=(edge.get("api_key") or "").strip(),
+            provider=(edge.get("provider") or "").strip(),
+            api_mode=(edge.get("api_mode") or "").strip(),
+        )
+        logging.info(
+            "%shybrid-gateway: compression threshold synced to edge "
+            "ctx=%s (compress at %s)",
+            self.log_prefix,
+            f"{ctx:,}",
+            f"{cc.threshold_tokens:,}",
+        )
+        return True
+
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Switch the model/provider in-place for a live agent.
 
@@ -2777,6 +3020,8 @@ class AIAgent:
                 provider=self.provider,
                 api_mode=self.api_mode,
             )
+            # Cloud/primary switch_model updates ctx above; re-sync edge budget.
+            self._sync_hybrid_edge_compression_context()
 
         # ── Invalidate cached system prompt so it rebuilds next turn ──
         self._cached_system_prompt = None
@@ -2947,6 +3192,182 @@ class AIAgent:
                 self.status_callback("warn", message)
             except Exception:
                 logger.debug("status_callback error in _emit_warning", exc_info=True)
+
+    def _emit_usage_snapshot(self, *, context_tokens: int | None = None) -> None:
+        """Push live context-meter updates to gateway/TUI during multi-step turns."""
+        if not self.status_callback:
+            return
+        try:
+            from agent.tui_usage import build_agent_usage
+
+            usage = build_agent_usage(self, context_tokens=context_tokens)
+            self.status_callback("usage", "", usage=usage)
+        except TypeError:
+            pass
+        except Exception:
+            logger.debug("status_callback error in _emit_usage_snapshot", exc_info=True)
+        else:
+            self._flush_status_callback()
+
+    def _effective_compression_model(self) -> str:
+        """Model slug used for the auxiliary compression summary LLM call."""
+        cc = getattr(self, "context_compressor", None)
+        if cc is not None:
+            summary_model = (getattr(cc, "summary_model", None) or "").strip()
+            if summary_model and not getattr(cc, "_summary_model_fallen_back", False):
+                return summary_model
+        try:
+            from agent.auxiliary_client import get_text_auxiliary_client
+
+            _, aux_model = get_text_auxiliary_client(
+                "compression",
+                main_runtime=self._current_main_runtime(),
+            )
+            if aux_model and str(aux_model).strip():
+                return str(aux_model).strip()
+        except Exception:
+            pass
+        return (getattr(self, "model", None) or "").strip()
+
+    def _emit_compressing_progress(
+        self,
+        messages: list,
+        *,
+        approx_tokens: int | None = None,
+        focus_topic: str | None = None,
+        text_override: str | None = None,
+        summary_budget: int | None = None,
+        summarize_input_tokens: int | None = None,
+    ) -> None:
+        """Surface in-flight context compression (TUI transcript + status bar).
+
+        Uses ``status_callback("compressing", ...)`` so gateway/TUI parity matches
+        manual ``/compress``.  CLI still sees output via ``_vprint(force=True)``.
+        """
+        compression_model = self._effective_compression_model()
+        tokens = approx_tokens
+        if text_override:
+            text = text_override
+        else:
+            from agent.context_compressor import format_compressing_progress_text
+
+            n = len(messages)
+            if not tokens:
+                try:
+                    tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=getattr(self, "_cached_system_prompt", "") or "",
+                        tools=self.tools or None,
+                    )
+                except Exception:
+                    tokens = 0
+            if summary_budget is None or summarize_input_tokens is None:
+                compressor = getattr(self, "context_compressor", None)
+                if compressor is not None:
+                    try:
+                        preview = compressor.preview_compression_stats(messages)
+                        if preview:
+                            if summary_budget is None:
+                                summary_budget = preview.get("summary_budget")
+                            if summarize_input_tokens is None:
+                                summarize_input_tokens = preview.get(
+                                    "summarize_input_tokens"
+                                )
+                    except Exception:
+                        pass
+            text = format_compressing_progress_text(
+                n,
+                approx_tokens=tokens or None,
+                summary_budget=summary_budget,
+                summarize_input_tokens=summarize_input_tokens,
+                focus_topic=focus_topic,
+            )
+        # Preflight / in-turn compression uses a fresh rough estimate (or
+        # approx_tokens from the caller).  Push it to the TUI context meter
+        # immediately — last_prompt_tokens still reflects the previous API
+        # response until compression finishes.
+        if tokens:
+            self._emit_usage_snapshot(context_tokens=tokens)
+        try:
+            self._vprint(f"{self.log_prefix}{text}", force=True)
+        except Exception:
+            pass
+        # Show compression in the status badge (replaces edge/cloud until done).
+        if self.status_callback:
+            try:
+                self.status_callback(
+                    "hybrid",
+                    "compressing",
+                    hybrid_tier="compressing",
+                    hybrid_escalated=False,
+                    model=compression_model,
+                )
+            except TypeError:
+                pass
+            except Exception:
+                logger.debug(
+                    "status_callback error in _emit_compressing_progress (hybrid)",
+                    exc_info=True,
+                )
+        if self.status_callback:
+            try:
+                self.status_callback("compressing", text, model=compression_model)
+            except TypeError:
+                self.status_callback("compressing", text)
+            except Exception:
+                logger.debug(
+                    "status_callback error in _emit_compressing_progress",
+                    exc_info=True,
+                )
+        self._flush_status_callback()
+        try:
+            import time
+            time.sleep(0)
+        except Exception:
+            pass
+
+    def _emit_compression_summary(self, summary: dict) -> None:
+        """Emit post-compression summary lines (TUI transcript + CLI)."""
+        headline = (summary or {}).get("headline") or ""
+        if not headline:
+            return
+        prefix = "" if summary.get("noop") else "✓ "
+        lines = [f"{prefix}{headline}"]
+        token_line = summary.get("token_line")
+        if token_line:
+            lines.append(f"  {token_line}")
+        note = summary.get("note")
+        if note:
+            lines.append(f"  {note}")
+        for line in lines:
+            try:
+                self._vprint(f"{self.log_prefix}{line}", force=True)
+            except Exception:
+                pass
+            if self.status_callback:
+                try:
+                    self.status_callback("compressed", line)
+                except Exception:
+                    logger.debug(
+                        "status_callback error in _emit_compression_summary",
+                        exc_info=True,
+                    )
+
+    def _clear_compressing_status(self) -> None:
+        """Revert gateway/TUI status bar after compression finishes."""
+        if self.status_callback:
+            try:
+                self.status_callback("ready", None)
+            except Exception:
+                logger.debug(
+                    "status_callback error in _clear_compressing_status",
+                    exc_info=True,
+                )
+        # Mid-turn compression swaps the route badge for "compressing"; restore or clear.
+        if (getattr(self, "_hybrid_tier", None) or "").strip():
+            self._emit_hybrid_route_status()
+        else:
+            self._clear_hybrid_badge()
 
     # Headers we capture from the dying stream's HTTP response so post-mortem
     # diagnosis can answer "which CF edge / which OpenRouter downstream
@@ -10653,7 +11074,18 @@ class AIAgent:
         """
         return self.api_mode != "codex_responses"
 
-    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None) -> tuple:
+    def _compress_context(
+        self,
+        messages: list,
+        system_message: str,
+        *,
+        approx_tokens: int = None,
+        task_id: str = "default",
+        focus_topic: str = None,
+        compress_status_override: str | None = None,
+        emit_progress: bool = True,
+        emit_summary: bool = True,
+    ) -> tuple:
         """Compress conversation context and split the session in SQLite.
 
         Args:
@@ -10665,174 +11097,211 @@ class AIAgent:
             (compressed_messages, new_system_prompt) tuple
         """
         _pre_msg_count = len(messages)
+        _before_tokens = approx_tokens
+        if not _before_tokens:
+            try:
+                _before_tokens = estimate_request_tokens_rough(
+                    messages,
+                    system_prompt=getattr(self, "_cached_system_prompt", "") or "",
+                    tools=self.tools or None,
+                )
+            except Exception:
+                _before_tokens = 0
         logger.info(
             "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
             self.session_id or "none", _pre_msg_count,
-            f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
+            f"{_before_tokens:,}" if _before_tokens else "unknown", self.model,
             focus_topic,
         )
-        self._emit_status(
-            "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
-        )
+        _compression_summary = None
+        try:
+            if emit_progress:
+                self._emit_compressing_progress(
+                    messages,
+                    approx_tokens=_before_tokens or None,
+                    focus_topic=focus_topic,
+                    text_override=compress_status_override,
+                )
 
-        # Notify external memory provider before compression discards context
-        if self._memory_manager:
+            # Notify external memory provider before compression discards context
+            if self._memory_manager:
+                try:
+                    self._memory_manager.on_pre_compress(messages)
+                except Exception:
+                    pass
+
             try:
-                self._memory_manager.on_pre_compress(messages)
+                compressed = self.context_compressor.compress(
+                    messages, current_tokens=approx_tokens, focus_topic=focus_topic
+                )
+            except TypeError:
+                # Plugin context engine with strict signature that doesn't accept
+                # focus_topic — fall back to calling without it.
+                compressed = self.context_compressor.compress(
+                    messages, current_tokens=approx_tokens
+                )
+
+            summary_error = getattr(self.context_compressor, "_last_summary_error", None)
+            if summary_error:
+                if getattr(self, "_last_compression_summary_warning", None) != summary_error:
+                    self._last_compression_summary_warning = summary_error
+                    self._emit_warning(
+                        f"⚠ Compression summary failed: {summary_error}. "
+                        "Inserted a fallback context marker."
+                    )
+            else:
+                # No hard failure — but did the configured aux model error out
+                # and get recovered by retrying on main?  Surface that so users
+                # know their auxiliary.compression.model setting is broken even
+                # though compression succeeded.
+                _aux_fail_model = getattr(self.context_compressor, "_last_aux_model_failure_model", None)
+                _aux_fail_err = getattr(self.context_compressor, "_last_aux_model_failure_error", None)
+                if _aux_fail_model:
+                    # Dedup on (model, error) so we don't spam on every compaction
+                    _aux_key = (_aux_fail_model, _aux_fail_err)
+                    if getattr(self, "_last_aux_fallback_warning_key", None) != _aux_key:
+                        self._last_aux_fallback_warning_key = _aux_key
+                        self._emit_warning(
+                            f"ℹ Configured compression model '{_aux_fail_model}' failed "
+                            f"({_aux_fail_err or 'unknown error'}). Recovered using main model — "
+                            "check auxiliary.compression.model in config.yaml."
+                        )
+
+            todo_snapshot = self._todo_store.format_for_injection()
+            if todo_snapshot:
+                compressed.append({"role": "user", "content": todo_snapshot})
+
+            self._invalidate_system_prompt()
+            new_system_prompt = self._build_system_prompt(system_message)
+            self._cached_system_prompt = new_system_prompt
+
+            if self._session_db:
+                try:
+                    # Propagate title to the new session with auto-numbering
+                    old_title = self._session_db.get_session_title(self.session_id)
+                    # Trigger memory extraction on the old session before it rotates.
+                    self.commit_memory_session(messages)
+                    self._session_db.end_session(self.session_id, "compression")
+                    old_session_id = self.session_id
+                    self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                    os.environ["HERMES_SESSION_ID"] = self.session_id
+                    try:
+                        from gateway.session_context import _SESSION_ID
+                        _SESSION_ID.set(self.session_id)
+                    except Exception:
+                        pass
+                    # Update session_log_file to point to the new session's JSON file
+                    self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
+                    self._session_db_created = False
+                    self._session_db.create_session(
+                        session_id=self.session_id,
+                        source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                        model=self.model,
+                        model_config=self._session_init_model_config,
+                        parent_session_id=old_session_id,
+                    )
+                    self._session_db_created = True
+                    # Auto-number the title for the continuation session
+                    if old_title:
+                        try:
+                            new_title = self._session_db.get_next_title_in_lineage(old_title)
+                            self._session_db.set_session_title(self.session_id, new_title)
+                        except (ValueError, Exception) as e:
+                            logger.debug("Could not propagate title on compression: %s", e)
+                    self._session_db.update_system_prompt(self.session_id, new_system_prompt)
+                    # Reset flush cursor — new session starts with no messages written
+                    self._last_flushed_db_idx = 0
+                except Exception as e:
+                    logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+
+            # Notify the context engine that the session_id rotated because of
+            # compression (not a fresh /new). Plugin engines (e.g. hermes-lcm) use
+            # boundary_reason="compression" to preserve DAG lineage across the
+            # rollover instead of re-initializing fresh per-session state.
+            # See hermes-lcm#68. Built-in ContextCompressor ignores kwargs.
+            try:
+                _old_sid = locals().get("old_session_id")
+                if _old_sid and hasattr(self.context_compressor, "on_session_start"):
+                    self.context_compressor.on_session_start(
+                        self.session_id or "",
+                        boundary_reason="compression",
+                        old_session_id=_old_sid,
+                    )
+            except Exception as _ce_err:
+                logger.debug("context engine on_session_start (compression): %s", _ce_err)
+
+            # Notify memory providers of the compression-driven session_id rotation
+            # so provider-cached per-session state (Hindsight's _document_id,
+            # accumulated turn buffers, counters) refreshes. reset=False because
+            # the logical conversation continues; only the id and DB row rolled
+            # over. See #6672.
+            try:
+                _old_sid = locals().get("old_session_id")
+                if _old_sid and self._memory_manager:
+                    self._memory_manager.on_session_switch(
+                        self.session_id or "",
+                        parent_session_id=_old_sid,
+                        reset=False,
+                        reason="compression",
+                    )
+            except Exception as _me_err:
+                logger.debug("memory manager on_session_switch (compression): %s", _me_err)
+
+            # Warn on repeated compressions (quality degrades with each pass)
+            _cc = self.context_compressor.compression_count
+            if _cc >= 2:
+                self._vprint(
+                    f"{self.log_prefix}⚠️  Session compressed {_cc} times — "
+                    f"accuracy may degrade. Consider /new to start fresh.",
+                    force=True,
+                )
+
+            # Update token estimate after compaction so pressure calculations
+            # use the post-compression count, not the stale pre-compression one.
+            # Use estimate_request_tokens_rough() so tool schemas are included —
+            # with 50+ tools enabled, schemas alone can add 20-30K tokens, and
+            # omitting them delays the next compression cycle far past the
+            # configured threshold (issue #14695).
+            _compressed_est = estimate_request_tokens_rough(
+                compressed,
+                system_prompt=new_system_prompt or "",
+                tools=self.tools or None,
+            )
+            self.context_compressor.last_prompt_tokens = _compressed_est
+            self.context_compressor.last_completion_tokens = 0
+            self._emit_usage_snapshot()
+
+            # Clear the file-read dedup cache.  After compression the original
+            # read content is summarised away — if the model re-reads the same
+            # file it needs the full content, not a "file unchanged" stub.
+            try:
+                from tools.file_tools import reset_file_dedup
+                reset_file_dedup(task_id)
             except Exception:
                 pass
 
-        try:
-            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
-        except TypeError:
-            # Plugin context engine with strict signature that doesn't accept
-            # focus_topic — fall back to calling without it.
-            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
-
-        summary_error = getattr(self.context_compressor, "_last_summary_error", None)
-        if summary_error:
-            if getattr(self, "_last_compression_summary_warning", None) != summary_error:
-                self._last_compression_summary_warning = summary_error
-                self._emit_warning(
-                    f"⚠ Compression summary failed: {summary_error}. "
-                    "Inserted a fallback context marker."
-                )
-        else:
-            # No hard failure — but did the configured aux model error out
-            # and get recovered by retrying on main?  Surface that so users
-            # know their auxiliary.compression.model setting is broken even
-            # though compression succeeded.
-            _aux_fail_model = getattr(self.context_compressor, "_last_aux_model_failure_model", None)
-            _aux_fail_err = getattr(self.context_compressor, "_last_aux_model_failure_error", None)
-            if _aux_fail_model:
-                # Dedup on (model, error) so we don't spam on every compaction
-                _aux_key = (_aux_fail_model, _aux_fail_err)
-                if getattr(self, "_last_aux_fallback_warning_key", None) != _aux_key:
-                    self._last_aux_fallback_warning_key = _aux_key
-                    self._emit_warning(
-                        f"ℹ Configured compression model '{_aux_fail_model}' failed "
-                        f"({_aux_fail_err or 'unknown error'}). Recovered using main model — "
-                        "check auxiliary.compression.model in config.yaml."
-                    )
-
-        todo_snapshot = self._todo_store.format_for_injection()
-        if todo_snapshot:
-            compressed.append({"role": "user", "content": todo_snapshot})
-
-        self._invalidate_system_prompt()
-        new_system_prompt = self._build_system_prompt(system_message)
-        self._cached_system_prompt = new_system_prompt
-
-        if self._session_db:
-            try:
-                # Propagate title to the new session with auto-numbering
-                old_title = self._session_db.get_session_title(self.session_id)
-                # Trigger memory extraction on the old session before it rotates.
-                self.commit_memory_session(messages)
-                self._session_db.end_session(self.session_id, "compression")
-                old_session_id = self.session_id
-                self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-                os.environ["HERMES_SESSION_ID"] = self.session_id
-                try:
-                    from gateway.session_context import _SESSION_ID
-                    _SESSION_ID.set(self.session_id)
-                except Exception:
-                    pass
-                # Update session_log_file to point to the new session's JSON file
-                self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
-                self._session_db_created = False
-                self._session_db.create_session(
-                    session_id=self.session_id,
-                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                    model=self.model,
-                    model_config=self._session_init_model_config,
-                    parent_session_id=old_session_id,
-                )
-                self._session_db_created = True
-                # Auto-number the title for the continuation session
-                if old_title:
-                    try:
-                        new_title = self._session_db.get_next_title_in_lineage(old_title)
-                        self._session_db.set_session_title(self.session_id, new_title)
-                    except (ValueError, Exception) as e:
-                        logger.debug("Could not propagate title on compression: %s", e)
-                self._session_db.update_system_prompt(self.session_id, new_system_prompt)
-                # Reset flush cursor — new session starts with no messages written
-                self._last_flushed_db_idx = 0
-            except Exception as e:
-                logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
-
-        # Notify the context engine that the session_id rotated because of
-        # compression (not a fresh /new). Plugin engines (e.g. hermes-lcm) use
-        # boundary_reason="compression" to preserve DAG lineage across the
-        # rollover instead of re-initializing fresh per-session state.
-        # See hermes-lcm#68. Built-in ContextCompressor ignores kwargs.
-        try:
-            _old_sid = locals().get("old_session_id")
-            if _old_sid and hasattr(self.context_compressor, "on_session_start"):
-                self.context_compressor.on_session_start(
-                    self.session_id or "",
-                    boundary_reason="compression",
-                    old_session_id=_old_sid,
-                )
-        except Exception as _ce_err:
-            logger.debug("context engine on_session_start (compression): %s", _ce_err)
-
-        # Notify memory providers of the compression-driven session_id rotation
-        # so provider-cached per-session state (Hindsight's _document_id,
-        # accumulated turn buffers, counters) refreshes. reset=False because
-        # the logical conversation continues; only the id and DB row rolled
-        # over. See #6672.
-        try:
-            _old_sid = locals().get("old_session_id")
-            if _old_sid and self._memory_manager:
-                self._memory_manager.on_session_switch(
-                    self.session_id or "",
-                    parent_session_id=_old_sid,
-                    reset=False,
-                    reason="compression",
-                )
-        except Exception as _me_err:
-            logger.debug("memory manager on_session_switch (compression): %s", _me_err)
-
-        # Warn on repeated compressions (quality degrades with each pass)
-        _cc = self.context_compressor.compression_count
-        if _cc >= 2:
-            self._vprint(
-                f"{self.log_prefix}⚠️  Session compressed {_cc} times — "
-                f"accuracy may degrade. Consider /new to start fresh.",
-                force=True,
+            logger.info(
+                "context compression done: session=%s messages=%d->%d tokens=~%s",
+                self.session_id or "none", _pre_msg_count, len(compressed),
+                f"{_compressed_est:,}",
             )
+            try:
+                from agent.manual_compression_feedback import summarize_manual_compression
 
-        # Update token estimate after compaction so pressure calculations
-        # use the post-compression count, not the stale pre-compression one.
-        # Use estimate_request_tokens_rough() so tool schemas are included —
-        # with 50+ tools enabled, schemas alone can add 20-30K tokens, and
-        # omitting them delays the next compression cycle far past the
-        # configured threshold (issue #14695).
-        _compressed_est = estimate_request_tokens_rough(
-            compressed,
-            system_prompt=new_system_prompt or "",
-            tools=self.tools or None,
-        )
-        self.context_compressor.last_prompt_tokens = _compressed_est
-        self.context_compressor.last_completion_tokens = 0
-
-        # Clear the file-read dedup cache.  After compression the original
-        # read content is summarised away — if the model re-reads the same
-        # file it needs the full content, not a "file unchanged" stub.
-        try:
-            from tools.file_tools import reset_file_dedup
-            reset_file_dedup(task_id)
-        except Exception:
-            pass
-
-        logger.info(
-            "context compression done: session=%s messages=%d->%d tokens=~%s",
-            self.session_id or "none", _pre_msg_count, len(compressed),
-            f"{_compressed_est:,}",
-        )
-        return compressed, new_system_prompt
+                _compression_summary = summarize_manual_compression(
+                    messages,
+                    compressed,
+                    _before_tokens or 0,
+                    _compressed_est,
+                )
+            except Exception:
+                _compression_summary = None
+            return compressed, new_system_prompt
+        finally:
+            if emit_summary and _compression_summary:
+                self._emit_compression_summary(_compression_summary)
+            if emit_progress or emit_summary:
+                self._clear_compressing_status()
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""
@@ -12362,6 +12831,10 @@ class AIAgent:
 
         active_system_prompt = self._cached_system_prompt
 
+        # Hybrid-gateway: preflight runs before pre_model_resolve — align
+        # compressor threshold with edge ctx so we don't use last turn's window.
+        self._sync_hybrid_edge_compression_context()
+
         # ── Preflight context compression ──
         # Before entering the main loop, check if the loaded conversation
         # history already exceeds the model's context threshold.  This handles
@@ -12429,6 +12902,38 @@ class AIAgent:
                     )
                     if _preflight_tokens < self.context_compressor.threshold_tokens:
                         break  # Under threshold
+
+        # Plugin hook: pre_model_resolve (per-turn model routing, e.g. hybrid gateway)
+        try:
+            from hermes_cli.plugins import get_pre_model_resolve_override
+
+            self._emit_hybrid_phase("classifying")
+
+            _approx_for_route = estimate_request_tokens_rough(
+                messages,
+                system_prompt=active_system_prompt or "",
+                tools=self.tools or None,
+            )
+            _resolve_override = get_pre_model_resolve_override(
+                session_id=self.session_id,
+                user_message=original_user_message,
+                conversation_history=list(messages),
+                is_first_turn=(not bool(conversation_history)),
+                model=self.model,
+                provider=self.provider,
+                platform=getattr(self, "platform", None) or "",
+                sender_id=getattr(self, "_user_id", None) or "",
+                approximate_context_tokens=_approx_for_route,
+            )
+            if _resolve_override:
+                self.apply_hybrid_model_resolve(_resolve_override)
+            else:
+                self._hybrid_tier = None
+                self._hybrid_escalated = False
+                self._hybrid_reason = ""
+                self._clear_hybrid_badge()
+        except Exception as exc:
+            logger.warning("pre_model_resolve hook failed: %s", exc)
 
         # Plugin hook: pre_llm_call
         # Fired once per turn before the tool-calling loop.  Plugins can
@@ -13401,6 +13906,15 @@ class AIAgent:
                                     restart_with_length_continuation = True
                                     break
 
+                                if self._escalate_hybrid_to_cloud(escalated_note="length→cloud"):
+                                    length_continue_retries = 0
+                                    truncated_response_parts = []
+                                    self._vprint(
+                                        f"{self.log_prefix}↻ Edge length limit — escalating to cloud..."
+                                    )
+                                    restart_with_length_continuation = True
+                                    break
+
                                 partial_response = self._strip_think_blocks("".join(truncated_response_parts)).strip()
                                 self._cleanup_task_resources(effective_task_id)
                                 self._persist_session(messages, conversation_history)
@@ -13486,6 +14000,7 @@ class AIAgent:
                             "total_tokens": total_tokens,
                         }
                         self.context_compressor.update_from_response(usage_dict)
+                        self._emit_usage_snapshot()
 
                         # Cache discovered context length after successful call.
                         # Only persist limits confirmed by the provider (parsed
@@ -14548,12 +15063,14 @@ class AIAgent:
                                 "failed": True,
                                 "compression_exhausted": True,
                             }
-                        self._emit_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
-
                         original_len = len(messages)
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
+                            compress_status_override=(
+                                f"⠋ compressing (~{approx_tokens:,} tok) — "
+                                f"attempt {compression_attempts}/{max_compression_attempts}…"
+                            ),
                         )
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
@@ -14562,12 +15079,26 @@ class AIAgent:
 
                         if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
                             if len(messages) < original_len:
-                                self._emit_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
+                                self._emit_compression_summary({
+                                    "noop": True,
+                                    "headline": (
+                                        f"↻ Compressed {original_len} → {len(messages)} "
+                                        "messages, retrying…"
+                                    ),
+                                })
                             time.sleep(2)  # Brief pause between compression retries
                             restart_with_compressed_messages = True
                             break
                         else:
                             # Can't compress further and already at minimum tier
+                            if self._escalate_hybrid_to_cloud(escalated_note="context→cloud"):
+                                compression_attempts = 0
+                                self._vprint(
+                                    f"{self.log_prefix}↻ Edge context limit — escalating to cloud...",
+                                    force=True,
+                                )
+                                restart_with_compressed_messages = True
+                                break
                             self._vprint(f"{self.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                             logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
@@ -15330,8 +15861,9 @@ class AIAgent:
                             messages, tools=self.tools or None
                         )
 
+                    self._emit_usage_snapshot(context_tokens=_real_tokens)
+
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
-                        self._safe_print("  ⟳ compacting context…")
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message,
                             approx_tokens=self.context_compressor.last_prompt_tokens,

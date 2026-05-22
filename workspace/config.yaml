@@ -74,6 +74,12 @@ auxiliary:
     model: stepfun/step-3.5-flash
     provider: openrouter
     timeout: 600
+  classifier:
+    provider: custom
+    model: gemma-4-26B-A4B-it-UD-Q4_K_M
+    base_url: http://127.0.0.1:13141/v1
+    timeout: 600
+    max_tokens: 256
   curator:
     api_key: ''
     base_url: ''
@@ -172,8 +178,9 @@ command_allowlist: []
 compression:
   enabled: true
   hygiene_hard_message_limit: 400
+  protect_first_n: 0
   protect_last_n: 1
-  target_ratio: 0.2
+  target_ratio: 0.05
   threshold: 0.5
 context:
   engine: compressor
@@ -194,6 +201,33 @@ custom_providers:
 - base_url: http://127.0.0.1:13141/v1
   model: gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
   name: gemma-4-26B
+hybrid_gateway:
+  enabled: true
+  classifier:
+    mode: auxiliary
+    auxiliary_task: classifier
+    cacheEnabled: true
+    cacheTtlSeconds: 300
+    disableThinking: false
+  routing:
+    policy: cost-optimize-L2
+    policyArray:
+    - edge
+    - edge
+    - edge
+    - cloud
+    - cloud
+    bypassPatterns: []
+    edgeMaxContextTokens: 18432
+    skillRoutes: []
+  models:
+    classifier:
+      ref: auxiliary.classifier
+    edge:
+      ref: custom_providers.gemma-4-26B
+    cloud:
+      provider: openrouter
+      model: stepfun/step-3.5-flash
 dashboard:
   theme: default
 delegation:
@@ -318,6 +352,9 @@ openrouter:
   response_cache: true
   response_cache_ttl: 300
 personalities: {}
+plugins:
+  enabled:
+  - hybrid-gateway
 platform_toolsets:
   cli:
   - browser

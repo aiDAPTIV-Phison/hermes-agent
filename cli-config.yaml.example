@@ -449,6 +449,38 @@ prompt_caching:
 #                           # reasoning controls:
 #                           # extra_body:
 #                           #   enable_thinking: false
+#
+#   # Hybrid gateway classifier (side task — JSON complexity/skills only)
+#   classifier:
+#     provider: custom
+#     model: qwen2.5-3b-instruct
+#     base_url: http://127.0.0.1:11434/v1
+#     timeout: 15
+#     max_tokens: 256
+
+# =============================================================================
+# Hybrid Gateway (optional — bundled plugin: plugins/hybrid-gateway)
+# =============================================================================
+# Per-turn routing between classifier / edge / cloud tiers. Requires:
+#   hybrid_gateway.enabled: true
+#   auxiliary.classifier (for LLM classification)
+#   custom_providers entries for edge (and optional classifier) models
+#
+# hybrid_gateway:
+#   enabled: true
+#   classifier:
+#     mode: auxiliary              # auxiliary | heuristic
+#     auxiliary_task: classifier
+#   routing:
+#     policy: cost-optimize-L2
+#     policyArray: [classifier, classifier, edge, cloud, cloud]
+#     skillRoutes:
+#       - skillPattern: image-gen
+#         forceTier: cloud
+#   models:
+#     classifier: { ref: auxiliary.classifier }
+#     edge: { ref: custom_providers.my-local-model }
+#     cloud: { provider: openrouter, model: anthropic/claude-sonnet-4 }
 
 # =============================================================================
 # Persistent Memory
