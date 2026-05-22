@@ -59,6 +59,74 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+
+# Tagged queue items for chat-completions SSE (see _write_sse_chat_completion._emit).
+_SSE_TAG_TOOL_PROGRESS = "__tool_progress__"
+_SSE_TAG_REASONING_DELTA = "__reasoning_delta__"
+_SSE_TAG_THINKING_DELTA = "__thinking_delta__"
+_SSE_TAG_STATUS_UPDATE = "__status_update__"
+
+_SSE_CUSTOM_EVENT_NAMES = {
+    _SSE_TAG_TOOL_PROGRESS: "hermes.tool.progress",
+    _SSE_TAG_REASONING_DELTA: "hermes.reasoning.delta",
+    _SSE_TAG_THINKING_DELTA: "hermes.thinking.delta",
+    _SSE_TAG_STATUS_UPDATE: "hermes.status.update",
+}
+
+
+def _build_status_update_payload(kind: str, text: str | None = None, **extra: Any) -> dict | None:
+    """Build a ``hermes.status.update`` payload matching TUI gateway shape."""
+    if kind == "usage" and extra.get("usage") is not None:
+        return {"kind": "usage", "text": "", "usage": extra["usage"]}
+
+    body = ""
+    if text is not None:
+        body = str(text).strip()
+    elif kind is not None:
+        body = str(kind).strip()
+
+    payload: Dict[str, Any] = {
+        "kind": str(kind) if text is not None else "status",
+        "text": body,
+    }
+    for key, value in extra.items():
+        if value is not None:
+            payload[key] = value
+
+    if not body and kind not in (
+        "hybrid",
+        "compressing",
+        "compressed",
+        "usage",
+        "ready",
+        "lifecycle",
+        "warn",
+    ) and not extra:
+        return None
+    return payload
+
+
+def _make_chat_completions_agent_callbacks(stream_q) -> dict:
+    """Callbacks wired into AIAgent for ``/v1/chat/completions`` streaming."""
+
+    def _on_reasoning(text: str) -> None:
+        if text:
+            stream_q.put((_SSE_TAG_REASONING_DELTA, {"text": str(text)}))
+
+    def _on_thinking(text: str) -> None:
+        if text:
+            stream_q.put((_SSE_TAG_THINKING_DELTA, {"text": str(text)}))
+
+    def _on_status(kind, text=None, **kw) -> None:
+        payload = _build_status_update_payload(str(kind), text, **kw)
+        if payload is not None:
+            stream_q.put((_SSE_TAG_STATUS_UPDATE, payload))
+
+    return {
+        "thinking_callback": _on_thinking,
+        "reasoning_callback": _on_reasoning,
+        "status_callback": _on_status,
+    }
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 
@@ -822,6 +890,9 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        thinking_callback=None,
+        reasoning_callback=None,
+        status_callback=None,
         gateway_session_key: Optional[str] = None,
     ) -> Any:
         """
@@ -870,6 +941,9 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            thinking_callback=thinking_callback,
+            reasoning_callback=reasoning_callback,
+            status_callback=status_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -967,6 +1041,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
+                "reasoning_events": True,
+                "status_events": True,
                 "approval_events": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
@@ -1143,7 +1219,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _started_tool_call_ids.add(tool_call_id)
                 from agent.display import build_tool_preview, get_tool_emoji
                 label = build_tool_preview(function_name, function_args) or function_name
-                _stream_q.put(("__tool_progress__", {
+                _stream_q.put((_SSE_TAG_TOOL_PROGRESS, {
                     "tool": function_name,
                     "emoji": get_tool_emoji(function_name),
                     "label": label,
@@ -1161,7 +1237,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put(("__tool_progress__", {
+                _stream_q.put((_SSE_TAG_TOOL_PROGRESS, {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
@@ -1175,6 +1251,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
             # The structured callbacks are strictly richer (they carry the
             # tool_call id), so they own the chat-completions SSE channel.
+            _agent_cbs = _make_chat_completions_agent_callbacks(_stream_q)
+
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -1184,6 +1262,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                thinking_callback=_agent_cbs["thinking_callback"],
+                reasoning_callback=_agent_cbs["reasoning_callback"],
+                status_callback=_agent_cbs["status_callback"],
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
             ))
@@ -1355,16 +1436,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 """Write a single queue item to the SSE stream.
 
                 Plain strings are sent as normal ``delta.content`` chunks.
-                Tagged tuples ``("__tool_progress__", payload)`` are sent
-                as a custom ``event: hermes.tool.progress`` SSE event so
-                frontends can display them without storing the markers in
-                conversation history.  See #6972 for the original event,
-                #16588 for the ``toolCallId``/``status`` lifecycle fields.
+                Tagged tuples map to custom SSE events (see ``_SSE_CUSTOM_EVENT_NAMES``):
+                ``hermes.tool.progress``, ``hermes.reasoning.delta``,
+                ``hermes.thinking.delta``, and ``hermes.status.update``
+                (hybrid tier, compression progress, context meter).
+                Plain strings are sent as ``delta.content`` chunks.
+                See #6972 / #16588 for tool-progress lifecycle fields.
                 """
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and item[0] in _SSE_CUSTOM_EVENT_NAMES
+                ):
+                    event_name = _SSE_CUSTOM_EVENT_NAMES[item[0]]
                     event_data = json.dumps(item[1])
                     await response.write(
-                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                        f"event: {event_name}\ndata: {event_data}\n\n".encode()
                     )
                 else:
                     content_chunk = {
@@ -2707,6 +2794,9 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        thinking_callback=None,
+        reasoning_callback=None,
+        status_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
     ) -> tuple:
@@ -2731,6 +2821,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                thinking_callback=thinking_callback,
+                reasoning_callback=reasoning_callback,
+                status_callback=status_callback,
                 gateway_session_key=gateway_session_key,
             )
             if agent_ref is not None:

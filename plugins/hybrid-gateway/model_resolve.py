@@ -137,17 +137,16 @@ def resolve_all_tier_models(models_cfg: Dict[str, Any], config: Dict[str, Any]) 
     return out
 
 
-def resolve_edge_context_length(hg: Optional[Dict[str, Any]] = None) -> Optional[int]:
-    """Return the edge tier model context length for compression budgeting.
-
-    When hybrid-gateway is enabled, compression thresholds should track the
-    edge model window (not the configured primary or last cloud escalation).
-    """
+def _resolve_tier_context_length(
+    tier: str,
+    hg: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Return context length for a hybrid-gateway tier (edge or cloud)."""
     cfg = hg if hg is not None else load_full_config()
     if not cfg:
         return None
-    edge = (cfg.get("models") or {}).get("edge") or {}
-    model = (edge.get("model") or "").strip()
+    spec = (cfg.get("models") or {}).get(tier) or {}
+    model = (spec.get("model") or "").strip()
     if not model:
         return None
     try:
@@ -166,13 +165,23 @@ def resolve_edge_context_length(hg: Optional[Dict[str, Any]] = None) -> Optional
 
         return get_model_context_length(
             model,
-            base_url=(edge.get("base_url") or "").strip(),
-            api_key=(edge.get("api_key") or "").strip(),
-            provider=(edge.get("provider") or "").strip(),
+            base_url=(spec.get("base_url") or "").strip(),
+            api_key=(spec.get("api_key") or "").strip(),
+            provider=(spec.get("provider") or "").strip(),
             custom_providers=custom,
         )
     except Exception:
         return None
+
+
+def resolve_edge_context_length(hg: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """Return the edge tier model context length for compression budgeting."""
+    return _resolve_tier_context_length("edge", hg)
+
+
+def resolve_cloud_context_length(hg: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """Return the cloud tier model context length for compression budgeting."""
+    return _resolve_tier_context_length("cloud", hg)
 
 
 def load_full_config() -> Optional[Dict[str, Any]]:

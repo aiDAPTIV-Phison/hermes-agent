@@ -2496,8 +2496,8 @@ class AIAgent:
             else:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
 
-        # Hybrid-gateway: compression triggers use edge ctx, not primary/cloud.
-        self._sync_hybrid_edge_compression_context()
+        # Hybrid-gateway compression sync runs per turn after routing (see
+        # run_conversation pre_model_resolve + _sync_hybrid_compression_context).
 
         # Check immediately so CLI users see the warning at startup.
         # Gateway status_callback is not yet wired, so any warning is stored
@@ -2833,13 +2833,28 @@ class AIAgent:
                 )
         self._flush_status_callback()
 
-    def _sync_hybrid_edge_compression_context(self) -> bool:
-        """Size compression thresholds against the hybrid-gateway edge model.
+    def _hybrid_compression_budget_tier(self) -> Optional[str]:
+        """Which hybrid tier should size compression for the current phase.
 
-        Preflight compression runs before ``pre_model_resolve``, so without
-        this sync the compressor can keep the previous turn's (or primary)
-        model context window while the next turn routes to edge.
+        Cloud (and edge→cloud escalation) use the cloud window while the turn
+        is doing multi-round tool work. Edge and classifier use the edge window
+        when this turn is routed locally — including the final user-facing
+        conclusion on edge.
         """
+        tier = (getattr(self, "_hybrid_tier", None) or "").strip().lower()
+        if not tier:
+            return None
+        if tier == "cloud" or bool(getattr(self, "_hybrid_escalated", False)):
+            return "cloud"
+        if tier in ("edge", "classifier"):
+            return "edge"
+        return None
+
+    def _sync_hybrid_compression_context(self) -> bool:
+        """Align compression thresholds with the active hybrid-gateway tier."""
+        budget_tier = self._hybrid_compression_budget_tier()
+        if not budget_tier:
+            return False
         cc = getattr(self, "context_compressor", None)
         if cc is None:
             return False
@@ -2849,6 +2864,7 @@ class AIAgent:
             _ensure_plugins_discovered()
             from hermes_plugins.hybrid_gateway.model_resolve import (
                 load_full_config,
+                resolve_cloud_context_length,
                 resolve_edge_context_length,
             )
         except ImportError:
@@ -2856,11 +2872,16 @@ class AIAgent:
         hg = load_full_config()
         if not hg:
             return False
-        edge = (hg.get("models") or {}).get("edge") or {}
-        model = (edge.get("model") or "").strip()
+        spec = (hg.get("models") or {}).get(budget_tier) or {}
+        model = (spec.get("model") or "").strip()
         if not model:
             return False
-        ctx = resolve_edge_context_length(hg)
+        resolve_ctx = (
+            resolve_cloud_context_length
+            if budget_tier == "cloud"
+            else resolve_edge_context_length
+        )
+        ctx = resolve_ctx(hg)
         if not ctx:
             return False
         if getattr(cc, "context_length", None) == ctx:
@@ -2868,19 +2889,24 @@ class AIAgent:
         cc.update_model(
             model=model,
             context_length=ctx,
-            base_url=(edge.get("base_url") or "").strip(),
-            api_key=(edge.get("api_key") or "").strip(),
-            provider=(edge.get("provider") or "").strip(),
-            api_mode=(edge.get("api_mode") or "").strip(),
+            base_url=(spec.get("base_url") or "").strip(),
+            api_key=(spec.get("api_key") or "").strip(),
+            provider=(spec.get("provider") or "").strip(),
+            api_mode=(spec.get("api_mode") or "").strip(),
         )
         logging.info(
-            "%shybrid-gateway: compression threshold synced to edge "
+            "%shybrid-gateway: compression threshold synced to %s "
             "ctx=%s (compress at %s)",
             self.log_prefix,
+            budget_tier,
             f"{ctx:,}",
             f"{cc.threshold_tokens:,}",
         )
         return True
+
+    def _sync_hybrid_edge_compression_context(self) -> bool:
+        """Backward-compatible alias; prefer :meth:`_sync_hybrid_compression_context`."""
+        return self._sync_hybrid_compression_context()
 
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Switch the model/provider in-place for a live agent.
@@ -3020,8 +3046,8 @@ class AIAgent:
                 provider=self.provider,
                 api_mode=self.api_mode,
             )
-            # Cloud/primary switch_model updates ctx above; re-sync edge budget.
-            self._sync_hybrid_edge_compression_context()
+            # Re-sync hybrid compression budget for the active tier (cloud vs edge).
+            self._sync_hybrid_compression_context()
 
         # ── Invalidate cached system prompt so it rebuilds next turn ──
         self._cached_system_prompt = None
@@ -12831,17 +12857,45 @@ class AIAgent:
 
         active_system_prompt = self._cached_system_prompt
 
-        # Hybrid-gateway: preflight runs before pre_model_resolve — align
-        # compressor threshold with edge ctx so we don't use last turn's window.
-        self._sync_hybrid_edge_compression_context()
+        # Plugin hook: pre_model_resolve (per-turn model routing, e.g. hybrid gateway)
+        try:
+            from hermes_cli.plugins import get_pre_model_resolve_override
+
+            self._emit_hybrid_phase("classifying")
+
+            _approx_for_route = estimate_request_tokens_rough(
+                messages,
+                system_prompt=active_system_prompt or "",
+                tools=self.tools or None,
+            )
+            _resolve_override = get_pre_model_resolve_override(
+                session_id=self.session_id,
+                user_message=original_user_message,
+                conversation_history=list(messages),
+                is_first_turn=(not bool(conversation_history)),
+                model=self.model,
+                provider=self.provider,
+                platform=getattr(self, "platform", None) or "",
+                sender_id=getattr(self, "_user_id", None) or "",
+                approximate_context_tokens=_approx_for_route,
+            )
+            if _resolve_override:
+                self.apply_hybrid_model_resolve(_resolve_override)
+            else:
+                self._hybrid_tier = None
+                self._hybrid_escalated = False
+                self._hybrid_reason = ""
+                self._clear_hybrid_badge()
+        except Exception as exc:
+            logger.warning("pre_model_resolve hook failed: %s", exc)
+
+        # Hybrid-gateway: align compressor with routed tier (cloud vs edge) before
+        # preflight so cloud turns use the cloud window during multi-round work.
+        self._sync_hybrid_compression_context()
 
         # ── Preflight context compression ──
-        # Before entering the main loop, check if the loaded conversation
-        # history already exceeds the model's context threshold.  This handles
-        # cases where a user switches to a model with a smaller context window
-        # while having a large existing session — compress proactively rather
-        # than waiting for an API error (which might be caught as a non-retryable
-        # 4xx and abort the request entirely).
+        # After pre_model_resolve so hybrid-gateway can size thresholds from the
+        # routed tier (cloud window for cloud turns, edge for edge/classifier).
         if (
             self.compression_enabled
             and len(messages) > self.context_compressor.protect_first_n
@@ -12902,38 +12956,6 @@ class AIAgent:
                     )
                     if _preflight_tokens < self.context_compressor.threshold_tokens:
                         break  # Under threshold
-
-        # Plugin hook: pre_model_resolve (per-turn model routing, e.g. hybrid gateway)
-        try:
-            from hermes_cli.plugins import get_pre_model_resolve_override
-
-            self._emit_hybrid_phase("classifying")
-
-            _approx_for_route = estimate_request_tokens_rough(
-                messages,
-                system_prompt=active_system_prompt or "",
-                tools=self.tools or None,
-            )
-            _resolve_override = get_pre_model_resolve_override(
-                session_id=self.session_id,
-                user_message=original_user_message,
-                conversation_history=list(messages),
-                is_first_turn=(not bool(conversation_history)),
-                model=self.model,
-                provider=self.provider,
-                platform=getattr(self, "platform", None) or "",
-                sender_id=getattr(self, "_user_id", None) or "",
-                approximate_context_tokens=_approx_for_route,
-            )
-            if _resolve_override:
-                self.apply_hybrid_model_resolve(_resolve_override)
-            else:
-                self._hybrid_tier = None
-                self._hybrid_escalated = False
-                self._hybrid_reason = ""
-                self._clear_hybrid_badge()
-        except Exception as exc:
-            logger.warning("pre_model_resolve hook failed: %s", exc)
 
         # Plugin hook: pre_llm_call
         # Fired once per turn before the tool-calling loop.  Plugins can
@@ -15863,6 +15885,8 @@ class AIAgent:
 
                     self._emit_usage_snapshot(context_tokens=_real_tokens)
 
+                    if self.compression_enabled:
+                        self._sync_hybrid_compression_context()
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message,

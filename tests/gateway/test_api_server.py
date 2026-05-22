@@ -945,6 +945,67 @@ class TestChatCompletionsEndpoint:
                 assert '"toolCallId": "call_search_1"' in body
 
     @pytest.mark.asyncio
+    async def test_stream_emits_reasoning_and_status_events(self, adapter):
+        """Chat-completions SSE forwards Hermes reasoning/status for desktop/TUI parity."""
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                rc = kwargs.get("reasoning_callback")
+                sc = kwargs.get("status_callback")
+                if rc:
+                    rc("step one")
+                if sc:
+                    sc(
+                        "hybrid",
+                        "edge · model-x",
+                        hybrid_tier="edge",
+                        hybrid_escalated=False,
+                        model="provider/edge-model",
+                    )
+                    sc("compressing", "compressing 12 messages (~40k tok)…")
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    await asyncio.sleep(0.02)
+                    cb("Answer.")
+                return (
+                    {"final_response": "Answer.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+            assert "event: hermes.reasoning.delta" in body
+            assert '"text": "step one"' in body
+            assert "event: hermes.status.update" in body
+            assert '"kind": "hybrid"' in body
+            assert '"hybrid_tier": "edge"' in body
+            assert '"kind": "compressing"' in body
+            # Reasoning must not leak into delta.content
+            for line in body.splitlines():
+                if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                    try:
+                        chunk = _json.loads(line[len("data: "):])
+                    except _json.JSONDecodeError:
+                        continue
+                    if chunk.get("object") == "chat.completion.chunk":
+                        for choice in chunk.get("choices", []):
+                            content = choice.get("delta", {}).get("content", "")
+                            assert "step one" not in (content or "")
+
+    @pytest.mark.asyncio
     async def test_stream_emits_tool_lifecycle_with_call_id(self, adapter):
         """Regression for #16588.
 
